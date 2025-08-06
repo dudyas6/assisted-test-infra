@@ -34,7 +34,7 @@ function config_additional_modules() {
         echo "Enable EPEL for swtpm packages when on RHEL/CentOS based distributions"
         sudo dnf install -y \
             https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-        dnf install podman -y
+        sudo dnf install podman -y
         ;;
 
     *)
@@ -56,27 +56,63 @@ function install_libvirt() {
     # CRB repo is required for libvirt-devel in some versions of RHEL
     sudo dnf install -y 'dnf-command(config-manager)' || true
     sudo dnf config-manager --set-enabled crb || true
-    sudo dnf install -y \
-        libvirt \
-        libvirt-devel \
-        libvirt-daemon-kvm \
-        qemu-kvm \
-        libgcrypt \
-        swtpm \
-        swtpm-tools \
-        socat \
-        tigervnc-server
+    
+    OS_VERSION=$(awk -F= '/^VERSION_ID=/ { print $2 }' /etc/os-release | tr -d '"' | cut -f1 -d'.')
+    
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        echo "Installing libvirt packages for RHEL/CentOS 9 (modular daemons)"
+        sudo dnf install -y \
+            libvirt-daemon-driver-qemu \
+            libvirt-daemon-driver-storage-core \
+            libvirt-daemon-driver-network \
+            libvirt-daemon-driver-nodedev \
+            libvirt-daemon-driver-interface \
+            libvirt-devel \
+            qemu-kvm \
+            libvirt-client \
+            libgcrypt \
+            swtpm \
+            swtpm-tools \
+            socat \
+            tigervnc-server
 
-    sudo systemctl enable libvirtd
+        sudo systemctl enable virtqemud
+        sudo systemctl enable virtnetworkd
+    else
+        sudo dnf install -y \
+            libvirt \
+            libvirt-devel \
+            libvirt-daemon-kvm \
+            qemu-kvm \
+            libgcrypt \
+            swtpm \
+            swtpm-tools \
+            socat \
+            tigervnc-server
 
-    current_version="$(libvirtd --version | awk '{print $3}')"
+        sudo systemctl enable libvirtd
+    fi
+
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        current_version="$(virtqemud --version | awk '{print $3}')"
+    else
+        current_version="$(libvirtd --version | awk '{print $3}')"
+    fi
+    
     minimum_version="5.5.100"
 
     echo "Setting libvirt values"
-    sudo sed -i -e 's/#listen_tls/listen_tls/g' /etc/libvirt/libvirtd.conf
-    sudo sed -i -e 's/#listen_tcp/listen_tcp/g' /etc/libvirt/libvirtd.conf
-    sudo sed -i -e 's/#auth_tcp = "sasl"/auth_tcp = "none"/g' /etc/libvirt/libvirtd.conf
-    sudo sed -i -e 's/#tcp_port/tcp_port/g' /etc/libvirt/libvirtd.conf
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        sudo sed -i -e 's/#listen_tls/listen_tls/g' /etc/libvirt/virtqemud.conf
+        sudo sed -i -e 's/#listen_tcp/listen_tcp/g' /etc/libvirt/virtqemud.conf
+        sudo sed -i -e 's/#auth_tcp = "sasl"/auth_tcp = "none"/g' /etc/libvirt/virtqemud.conf
+        sudo sed -i -e 's/#tcp_port/tcp_port/g' /etc/libvirt/virtqemud.conf
+    else
+        sudo sed -i -e 's/#listen_tls/listen_tls/g' /etc/libvirt/libvirtd.conf
+        sudo sed -i -e 's/#listen_tcp/listen_tcp/g' /etc/libvirt/libvirtd.conf
+        sudo sed -i -e 's/#auth_tcp = "sasl"/auth_tcp = "none"/g' /etc/libvirt/libvirtd.conf
+        sudo sed -i -e 's/#tcp_port/tcp_port/g' /etc/libvirt/libvirtd.conf
+    fi
     sudo sed -i -e 's/#security_driver = "selinux"/security_driver = "none"/g' /etc/libvirt/qemu.conf
 
     allow_libvirt_cross_network_traffic
@@ -100,6 +136,13 @@ function install_virt_install() {
 }
 
 function add_libvirt_listen_flag() {
+    OS_VERSION=$(awk -F= '/^VERSION_ID=/ { print $2 }' /etc/os-release | tr -d '"' | cut -f1 -d'.')
+    
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        echo "Skipping listen flag in RHEL 9."
+        return
+    fi
+    
     if [[ -z $(sudo grep '#LIBVIRTD_ARGS="--listen"' /etc/sysconfig/libvirtd) ]]; then
         return
     fi
@@ -109,31 +152,51 @@ function add_libvirt_listen_flag() {
 }
 
 function start_and_enable_libvirtd_tcp_socket() {
-    if [[ $(is_libvirtd_tcp_socket_enabled_and_running) == "true" ]]; then
+    if [[ $(is_libvirt_tcp_socket_enabled_and_running) == "true" ]]; then
         return
     fi
-    echo "libvirtd version is greater then 5.5.x, starting libvirtd-tcp.socket"
-    echo "Removing --listen flag to libvirt"
     
     OS_VERSION=$(awk -F= '/^VERSION_ID=/ { print $2 }' /etc/os-release | tr -d '"' | cut -f1 -d'.')
-    if [[ "${OS_VERSION}" ==  "8" ]]; then
-        sudo sed -i -e 's/LIBVIRTD_ARGS="--listen"/#LIBVIRTD_ARGS="--listen"/g' /etc/sysconfig/libvirtd
-    fi
+    
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        echo "virtqemud version is greater then 5.5.x, starting virtqemud-tcp.socket"
+        sudo systemctl stop virtqemud
+        sudo systemctl unmask virtproxyd-tcp.socket
+        sudo systemctl unmask virtproxyd.socket
+        sudo systemctl unmask virtproxyd-ro.socket
+        sudo systemctl restart virtproxyd.socket
+        sudo systemctl enable --now virtproxyd-tcp.socket
+        sudo systemctl start virtqemud
+    else
+        echo "libvirtd version is greater then 5.5.x, starting libvirtd-tcp.socket"
+        echo "Removing --listen flag to libvirt"
+        
+        if [[ "${OS_VERSION}" ==  "8" ]]; then
+            sudo sed -i -e 's/LIBVIRTD_ARGS="--listen"/#LIBVIRTD_ARGS="--listen"/g' /etc/sysconfig/libvirtd
+        fi
 
-    sudo systemctl stop libvirtd
-    sudo systemctl unmask libvirtd-tcp.socket
-    sudo systemctl unmask libvirtd.socket
-    sudo systemctl unmask libvirtd-ro.socket
-    sudo systemctl restart libvirtd.socket
-    sudo systemctl enable --now libvirtd-tcp.socket
-    sudo systemctl start libvirtd
+        sudo systemctl stop libvirtd
+        sudo systemctl unmask libvirtd-tcp.socket
+        sudo systemctl unmask libvirtd.socket
+        sudo systemctl unmask libvirtd-ro.socket
+        sudo systemctl restart libvirtd.socket
+        sudo systemctl enable --now libvirtd-tcp.socket
+        sudo systemctl start libvirtd
+    fi
 }
 
-function is_libvirtd_tcp_socket_enabled_and_running() {
-    libvirtd_tcp_status=$(sudo systemctl status libvirtd-tcp.socket)
-    if [[ -z $(echo $libvirtd_tcp_status | grep running) ]]; then
+function is_libvirt_tcp_socket_enabled_and_running() { 
+    OS_VERSION=$(awk -F= '/^VERSION_ID=/ { print $2 }' /etc/os-release | tr -d '"' | cut -f1 -d'.')
+    
+    if [[ "${OS_VERSION}" == "9" ]]; then
+        socket_status=$(sudo systemctl status virtqemud-tcp.socket)
+    else
+        socket_status=$(sudo systemctl status libvirtd-tcp.socket)
+    fi
+    
+    if [[ -z $(echo $socket_status | grep running) ]]; then
         echo "false"
-    elif [[ -z $(echo $libvirtd_tcp_status | grep enabled) ]]; then
+    elif [[ -z $(echo $socket_status | grep enabled) ]]; then
         echo "false"
     else
         echo "true"
@@ -225,8 +288,11 @@ function config_firewalld() {
     sudo systemctl unmask --now firewalld
     sudo systemctl start firewalld
 
-    # Restart to see we are using firewalld
-    sudo systemctl restart libvirtd
+    if systemctl list-units --type=service | grep -q virtqemud; then
+        sudo systemctl restart virtqemud
+    else
+        sudo systemctl restart libvirtd
+    fi
 }
 
 function config_squid() {
